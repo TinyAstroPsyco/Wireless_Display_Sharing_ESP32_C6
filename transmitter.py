@@ -28,8 +28,8 @@ class CGPoint(ctypes.Structure):
 
 DEFAULT_IP = "192.168.1.100"
 DEFAULT_PORT = 8090
-DISPLAY_WIDTH = 135
-DISPLAY_HEIGHT = 240
+DISPLAY_WIDTH = 179
+DISPLAY_HEIGHT = 320
 HEADER_VERSION = 0x02  # carries frame_id in header (pixels)
 RUN_HEADER_VERSION = 0x01  # version for run packets
 
@@ -277,6 +277,9 @@ class ScreenshotPixelSender:
         elif self.rotate_deg == 270:
             frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
+        # Implementing a frame crop
+        # [Width, height]
+        # frame = frame[1600:1920, 100:400] # youcan change these values to crop the frame as you want
         resized = cv2.resize(frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
 
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
@@ -339,7 +342,7 @@ class ScreenshotPixelSender:
             payload = bytearray(header)
             append = payload.extend
             for x, y, color in zip(xs[start:end], ys[start:end], colors[start:end]):
-                append(struct.pack("<BBH", int(x), int(y), int(color)))
+                append(struct.pack("<HHH", int(x), int(y), int(color)))
             packets.append(bytes(payload))
             start = end
         return packets
@@ -390,7 +393,7 @@ class ScreenshotPixelSender:
             payload = bytearray(header)
             append = payload.extend
             for y, x0, length, color in runs[start:end]:
-                append(struct.pack("<BBBH", y, x0, length, color))
+                append(struct.pack("<HHHH", y, x0, length, color))
             packets.append(bytes(payload))
             start = end
         return packets

@@ -1,381 +1,415 @@
 /*
- * Pixel Update Receiver for ESP32 T-Display (ST7789 135x240)
- * Receives per-pixel updates (x, y, RGB565) over TCP and applies them.
- * Protocol v2 (little-endian):
- *   Header: 'P' 'X' 'U' 'P' (4 bytes) + version (1 byte, 0x02) + frame_id (uint32 LE) + count (uint16)
- *   Body:   count entries of: x (uint8), y (uint8), color (uint16 LE)
- *
- * Optimized for high frame rates with:
- * - Fast SPI clock (80MHz default, configurable)
- * - DMA support for efficient display updates
- * - Run-length encoding support for reduced bandwidth
+ * ESP32 Desktop Monitor - Receiver for ESP32-C6-LCD-1.47
+ * This receives pixel updates over WiFi and displays them on the LCD
  */
 
-#include <TFT_eSPI.h>
-#include <SPI.h>
 #include <WiFi.h>
-#include <WiFiServer.h>
-#include <esp_heap_caps.h>  // for PSRAM allocations
+#include <Arduino_GFX_Library.h>
 
-#define TFT_MADCTL 0x36
-#define TFT_MADCTL_RGB 0x00
-#define TFT_MADCTL_BGR 0x08
+// ==================== CONFIGURATION ====================
 
-TFT_eSPI tft = TFT_eSPI();
 
-// Display dimensions
-#define DISPLAY_WIDTH 135
-#define DISPLAY_HEIGHT 240
+// WiFi Credentials 
+const char* ssid = "Your SSID";
+const char* password = "Password";
+// TCP server port
+const uint16_t SERVER_PORT = 8090;
 
-// Try the fastest stable SPI clock for the panel; lower to 40000000 if unstable
-const uint32_t SPI_TARGET_FREQ = 80000000;
+// Display pins for ESP32-C6-LCD-1.47
+#define TFT_SCK   7
+#define TFT_MOSI  6
+#define TFT_CS    14
+#define TFT_DC    15
+#define TFT_RST   21
+#define TFT_BL    22
 
-// WiFi credentials - UPDATE THESE WITH YOUR NETWORK
-const char* ssid = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASSWORD";
+// Screen dimensions - using your working configuration, mine are set to the waveshare LCD 1.47" display with esp32 c6 board on board
+const uint16_t SCREEN_WIDTH = 179;   // Your working width
+const uint16_t SCREEN_HEIGHT = 320;  // Your working height
 
-// Network settings
-WiFiServer server(8090);  // dedicated port for pixel updates
+// Protocol constants
+const uint8_t PIXEL_PROTOCOL_VERSION = 2;  // PXUP uses version 2
+const uint8_t RUN_PROTOCOL_VERSION = 1;    // PXUR uses version 1
+const char PIXEL_UPDATE_MAGIC[] = "PXUP";  // Individual pixel updates
+const char RUN_UPDATE_MAGIC[] = "PXUR";     // Run-length encoded updates
+
+// ==================== GLOBALS ====================
+
+WiFiServer server(SERVER_PORT);
 WiFiClient client;
 
-// Protocol constants (v2 adds frame_id to the header)
-const uint8_t MAGIC[4] = {'P', 'X', 'U', 'P'};
-const uint8_t PROTO_VERSION = 0x02;
-const size_t HEADER_SIZE = 11;  // MAGIC (4) + version (1) + frame_id (4) + count (2)
-const uint8_t MAGIC_RUN[4] = {'P', 'X', 'U', 'R'};
-const uint8_t RUN_VERSION = 0x01;
-const size_t RUN_HEADER_SIZE = 11;  // MAGIC_RUN (4) + version (1) + frame_id (4) + count (2)
+// Display setup - using your working configuration
+Arduino_DataBus *bus = new Arduino_ESP32SPI(TFT_DC, TFT_CS, TFT_SCK, TFT_MOSI, -1);
+Arduino_GFX *gfx = new Arduino_ST7789(
+  bus, 
+  TFT_RST, 
+  0,              // rotation = 0 (portrait)
+  true,           // IPS display
+  179,            // width (your working value)
+  320,            // height (your working value)
+  30,             // col_offset (your working value), this is what worked for me
+  0               // row_offset
+);
 
-// Color configuration (adjust if colors appear swapped)
-bool swapBytesSetting = false;  // keep false; colors are provided as RGB565 little-endian
-bool useBgrSetting   = true;    // many ST7789 panels are BGR wired
+// Frame buffer for batch updates
+uint16_t* frameBuffer = nullptr;
+bool useFrameBuffer = false;
 
-// Stats
+// Statistics
+unsigned long lastFrameTime = 0;
 unsigned long frameCount = 0;
-unsigned long lastStats = 0;
-unsigned long updatesApplied = 0;
-uint32_t lastFrameId = 0;
+float fps = 0.0;
+
+// ==================== PACKET STRUCTURES ====================
+
+struct PixelPacketHeader {
+  char magic[4];        // "PXUP"
+  uint8_t version;      // Protocol version
+  uint32_t frameId;     // Frame identifier
+  uint16_t count;       // Number of pixel updates
+} __attribute__((packed));
 
 struct PixelUpdate {
   uint8_t x;
   uint8_t y;
-  uint8_t len;    // for run packets
-  uint16_t color;
-};
+  uint16_t color;  // RGB565
+} __attribute__((packed));
 
-PixelUpdate* updateBuffer = nullptr;
-uint32_t bufferCapacity = 0;
-bool dmaEnabled = false;
+struct RunPacketHeader {
+  char magic[4];        // "PXUR"
+  uint8_t version;      // Protocol version
+  uint32_t frameId;     // Frame identifier
+  uint16_t count;       // Number of run updates
+} __attribute__((packed));
 
-bool ensureUpdateBuffer(uint32_t needed) {
-  if (needed <= bufferCapacity && updateBuffer != nullptr) {
-    return true;
-  }
-  PixelUpdate* tmp = (PixelUpdate*)ps_malloc(needed * sizeof(PixelUpdate));
-  if (!tmp) {
-    tmp = (PixelUpdate*)malloc(needed * sizeof(PixelUpdate));
-  }
-  if (!tmp) {
-    Serial.println("Failed to allocate update buffer");
-    return false;
-  }
-  if (updateBuffer) {
-    free(updateBuffer);
-  }
-  updateBuffer = tmp;
-  bufferCapacity = needed;
-  return true;
+struct RunUpdate {
+  uint16_t y;
+  uint16_t x0;
+  uint16_t length;
+  uint16_t color;  // RGB565
+} __attribute__((packed));
+
+// ==================== HELPER FUNCTIONS ====================
+
+void displayIPAddress() {
+  gfx->fillScreen(0x0000);  // Black
+  gfx->setTextColor(0xFFFF); // White
+  gfx->setTextSize(2);
+  
+  gfx->setCursor(10, 10);
+  gfx->println("ESP32-C6");
+  gfx->setCursor(10, 35);
+  gfx->println("Desktop Monitor");
+  
+  gfx->setTextSize(1);
+  gfx->setCursor(10, 70);
+  gfx->println("Waiting for connection");
+  gfx->setCursor(10, 85);
+  gfx->print("IP: ");
+  gfx->println(WiFi.localIP());
+  gfx->setCursor(10, 100);
+  gfx->print("Port: ");
+  gfx->println(SERVER_PORT);
+  
+  Serial.println("\n=================================");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+  Serial.print("Port: ");
+  Serial.println(SERVER_PORT);
+  Serial.println("=================================\n");
 }
 
-bool readExactly(WiFiClient& c, uint8_t* dst, size_t len) {
-  size_t got = 0;
-  while (got < len && c.connected()) {
-    int chunk = c.read(dst + got, len - got);
-    if (chunk > 0) {
-      got += chunk;
+void displayConnectionStatus(bool connected) {
+  if (connected) {
+    gfx->fillScreen(0x07E0);  // Green
+    gfx->setTextColor(0x0000); // Black
+    gfx->setTextSize(2);
+    gfx->setCursor(20, SCREEN_HEIGHT/2 - 10);
+    gfx->println("Connected!");
+    delay(1000);
+    gfx->fillScreen(0x0000);  // Clear to black
+  } else {
+    displayIPAddress();
+  }
+}
+
+// Read exact number of bytes from client
+bool readExact(uint8_t* buffer, size_t length) {
+  size_t totalRead = 0;
+  unsigned long timeout = millis() + 5000;  // 5 second timeout
+  
+  while (totalRead < length && millis() < timeout) {
+    if (!client.connected()) {
+      return false;
+    }
+    
+    size_t available = client.available();
+    if (available > 0) {
+      size_t toRead = min(available, length - totalRead);
+      size_t read = client.read(buffer + totalRead, toRead);
+      totalRead += read;
     } else {
-      delay(1);  // allow other tasks
+      delay(1);  // Small delay to prevent tight loop
     }
   }
-  return got == len;
+  
+  return totalRead == length;
 }
 
-void applyColorConfig() {
-  tft.setSwapBytes(swapBytesSetting);
-  tft.writecommand(TFT_MADCTL);
-  tft.writedata(useBgrSetting ? TFT_MADCTL_BGR : TFT_MADCTL_RGB);
-}
+// These functions are no longer needed - packet processing is inline in loop()
 
-void showWaitingScreen() {
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setCursor(10, 20);
-  tft.setTextSize(2);
-  tft.println("Pixel RX");
-  tft.setCursor(10, 50);
-  tft.setTextSize(1);
-  tft.println("IP Address:");
-  tft.setCursor(10, 70);
-  tft.setTextSize(2);
-  tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.println(WiFi.localIP().toString());
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setCursor(10, 100);
-  tft.setTextSize(1);
-  tft.println("Waiting for");
-  tft.setCursor(10, 115);
-  tft.println("connection...");
-}
+// ==================== SETUP ====================
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
-  Serial.println("\n=== Pixel Update Receiver ===");
-
-  pinMode(4, OUTPUT);
-  digitalWrite(4, HIGH);  // backlight
-  tft.init();
-  SPI.setFrequency(SPI_TARGET_FREQ);
-  dmaEnabled = tft.initDMA();
-  tft.setRotation(0);  // portrait
-  applyColorConfig();
-  tft.fillScreen(TFT_BLACK);
-
+  delay(1000);
+  
+  Serial.println("\n\n=================================");
+  Serial.println("ESP32-C6 Desktop Monitor Receiver");
+  Serial.println("=================================");
+  
+  // Initialize backlight at LOW brightness to reduce heat
+  pinMode(TFT_BL, OUTPUT);
+  analogWrite(TFT_BL, 50);  // Only 20% brightness instead of 100%
+  
+  // Initialize display
+  Serial.println("Initializing display...");
+  gfx->begin();
+  gfx->fillScreen(0x0000);  // Black
+  
+  // Display startup message
+  gfx->setTextColor(0xFFFF); // White
+  gfx->setTextSize(2);
+  gfx->setCursor(10, 10);
+  gfx->println("Starting...");
+  
+  // Connect to WiFi with power saving
   Serial.print("Connecting to WiFi: ");
   Serial.println(ssid);
+  
+  gfx->setTextSize(1);
+  gfx->setCursor(10, 50);
+  gfx->print("WiFi: ");
+  gfx->println(ssid);
+  
   WiFi.mode(WIFI_STA);
+  
+  // Reduce WiFi power to save energy and reduce heat
+  // Options: WIFI_POWER_19_5dBm, WIFI_POWER_19dBm, WIFI_POWER_18_5dBm, 
+  //          WIFI_POWER_17dBm, WIFI_POWER_15dBm, WIFI_POWER_13dBm, 
+  //          WIFI_POWER_11dBm, WIFI_POWER_8_5dBm, WIFI_POWER_7dBm, 
+  //          WIFI_POWER_5dBm, WIFI_POWER_2dBm, WIFI_POWER_MINUS_1dBm
+  WiFi.setTxPower(WIFI_POWER_15dBm);  // Reduce from max (19.5dBm), 15dBm was the sweet spot for me
+  
   WiFi.begin(ssid, password);
-
+  
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-    delay(250);
+    delay(500);
     Serial.print(".");
+    gfx->print(".");
     attempts++;
   }
-
+  
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("\nWiFi connection failed");
-    tft.fillScreen(TFT_RED);
-    tft.setTextColor(TFT_WHITE, TFT_RED);
-    tft.setCursor(10, 50);
-    tft.setTextSize(2);
-    tft.println("WiFi FAILED!");
-    while (true) {
-      delay(1000);
-    }
+    Serial.println("\nFailed to connect to WiFi!");
+    gfx->setTextColor(0xF800); // Red
+    gfx->setCursor(10, 100);
+    gfx->println("WiFi Failed!");
+    while(1) { delay(1000); }
   }
-
-  Serial.println("\nWiFi connected");
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
-
-  showWaitingScreen();
-
+  
+  Serial.println("\nWiFi connected!");
+  
+  // Start TCP server
   server.begin();
-  server.setNoDelay(true);
-  Serial.println("Server listening on port 8090");
+  Serial.println("TCP server started");
+  
+  // Display IP address
+  displayIPAddress();
+  
+  // gfx->flush() does not work daaaaam
+  Serial.println("Ready to receive screen data");
 }
 
-bool handleClient() {
-  // Accept new client
-  if (!client || !client.connected()) {
-    client = server.available();
-    if (client) {
-      Serial.println("Client connected");
-      client.setNoDelay(true);
-      client.setTimeout(50);  // short timeout for reads
-      frameCount = 0;
-      updatesApplied = 0;
-      tft.fillScreen(TFT_BLACK);
-    }
-  }
-
-  if (!client || !client.connected()) {
-    return false;
-  }
-
-  // Require header to begin processing (pixel or run)
-  if (client.available() < 11) {
-    return true;  // keep connection, wait for more data
-  }
-
-  // Peek magic to decide packet type
-  uint8_t magicBuf[4];
-  if (!readExactly(client, magicBuf, 4)) {
-    client.stop();
-    return false;
-  }
-  bool isRun = (memcmp(magicBuf, MAGIC_RUN, 4) == 0);
-  bool isPixel = (memcmp(magicBuf, MAGIC, 4) == 0);
-
-  if (!isRun && !isPixel) {
-    Serial.println("Bad magic; flushing stream");
-    client.stop();
-    return false;
-  }
-
-  if (isPixel) {
-    uint8_t rest[HEADER_SIZE - 4];
-    if (!readExactly(client, rest, sizeof(rest))) {
-      Serial.println("Failed to read pixel header; dropping client");
-      client.stop();
-      return false;
-    }
-    if (rest[0] != PROTO_VERSION) {
-      Serial.print("Unsupported pixel version: ");
-      Serial.println(rest[0], HEX);
-      client.stop();
-      return false;
-    }
-
-    uint32_t frameId = ((uint32_t)rest[1]) | ((uint32_t)rest[2] << 8) | ((uint32_t)rest[3] << 16) | ((uint32_t)rest[4] << 24);
-    uint16_t count = rest[5] | (rest[6] << 8);  // little-endian
-    if (count == 0) {
-      frameCount++;
-      lastFrameId = frameId;
-      return true;
-    }
-    if (count > (DISPLAY_WIDTH * DISPLAY_HEIGHT)) {
-      Serial.print("Update count too large: ");
-      Serial.println(count);
-      client.stop();
-      return false;
-    }
-
-    if (!ensureUpdateBuffer(count)) {
-      Serial.println("No buffer for updates; dropping client");
-      client.stop();
-      return false;
-    }
-
-    uint8_t entry[4];
-    for (uint16_t i = 0; i < count; i++) {
-      if (!readExactly(client, entry, 4)) {
-        Serial.println("Stream ended mid-frame; dropping client");
-        client.stop();
-        return false;
-      }
-      updateBuffer[i].x = entry[0];
-      updateBuffer[i].y = entry[1];
-      updateBuffer[i].color = entry[2] | (entry[3] << 8);
-    }
-
-    // Apply all updates in one batch after the full frame is received
-    tft.startWrite();
-    for (uint16_t i = 0; i < count; i++) {
-      uint8_t x = updateBuffer[i].x;
-      uint8_t y = updateBuffer[i].y;
-      if (x < DISPLAY_WIDTH && y < DISPLAY_HEIGHT) {
-        tft.setAddrWindow(x, y, 1, 1);
-        tft.writeColor(updateBuffer[i].color, 1);
-        updatesApplied++;
-      }
-    }
-    tft.endWrite();
-
-    frameCount++;
-    lastFrameId = frameId;
-    unsigned long now = millis();
-    if (now - lastStats > 2000) {
-      Serial.print("Frames: ");
-      Serial.print(frameCount);
-      Serial.print(" (last frameId ");
-      Serial.print(lastFrameId);
-      Serial.print(") | Updates applied: ");
-      Serial.println(updatesApplied);
-      lastStats = now;
-    }
-    return true;
-  }
-
-  // Run packet
-  uint8_t rest[RUN_HEADER_SIZE - 4];
-  if (!readExactly(client, rest, sizeof(rest))) {
-    Serial.println("Failed to read run header; dropping client");
-    client.stop();
-    return false;
-  }
-  if (rest[0] != RUN_VERSION) {
-    Serial.print("Unsupported run version: ");
-    Serial.println(rest[0], HEX);
-    client.stop();
-    return false;
-  }
-
-  uint32_t frameId = ((uint32_t)rest[1]) | ((uint32_t)rest[2] << 8) | ((uint32_t)rest[3] << 16) | ((uint32_t)rest[4] << 24);
-  uint16_t count = rest[5] | (rest[6] << 8);  // number of runs
-  if (count == 0) {
-    frameCount++;
-    lastFrameId = frameId;
-    return true;
-  }
-  if (count > (DISPLAY_WIDTH * DISPLAY_HEIGHT)) {
-    Serial.print("Run count too large: ");
-    Serial.println(count);
-    client.stop();
-    return false;
-  }
-
-  if (!ensureUpdateBuffer(count)) {
-    Serial.println("No buffer for run updates; dropping client");
-    client.stop();
-    return false;
-  }
-
-  // Each run entry: y (1), x0 (1), length (1), color (2) = 5 bytes
-  uint8_t entry[5];
-  for (uint16_t i = 0; i < count; i++) {
-    if (!readExactly(client, entry, 5)) {
-      Serial.println("Stream ended mid-run frame; dropping client");
-      client.stop();
-      return false;
-    }
-    updateBuffer[i].y = entry[0];
-    updateBuffer[i].x = entry[1];
-    updateBuffer[i].len = entry[2];
-    updateBuffer[i].color = entry[3] | (entry[4] << 8);
-  }
-
-  // Apply runs in one batch
-  tft.startWrite();
-  for (uint16_t i = 0; i < count; i++) {
-    uint8_t x0 = updateBuffer[i].x;
-    uint8_t y = updateBuffer[i].y;
-    uint8_t runLen = updateBuffer[i].len;
-    if (x0 < DISPLAY_WIDTH && y < DISPLAY_HEIGHT && runLen > 0 && (x0 + runLen) <= DISPLAY_WIDTH) {
-      tft.setAddrWindow(x0, y, runLen, 1);
-      if (dmaEnabled) {
-        tft.pushBlock(updateBuffer[i].color, runLen);
-      } else {
-        tft.writeColor(updateBuffer[i].color, runLen);
-      }
-      updatesApplied += runLen;
-    }
-  }
-  tft.endWrite();
-
-  frameCount++;
-  lastFrameId = frameId;
-  unsigned long now = millis();
-  if (now - lastStats > 2000) {
-    Serial.print("Frames: ");
-    Serial.print(frameCount);
-    Serial.print(" (last frameId ");
-    Serial.print(lastFrameId);
-    Serial.print(") | Updates applied: ");
-    Serial.println(updatesApplied);
-    lastStats = now;
-  }
-
-  return true;
-}
+// ==================== MAIN LOOP ====================
 
 void loop() {
-  handleClient();
-  if (client && !client.connected()) {
-    Serial.println("Client disconnected");
-    showWaitingScreen();
+  // Check for new client connection
+  if (!client || !client.connected()) {
+    if (client) {
+      Serial.println("Client disconnected");
+      client.stop();
+      displayConnectionStatus(false);
+    }
+    
+    // Wait for new connection
+    client = server.available();
+    if (client) {
+      Serial.println("New client connected!");
+      Serial.print("Client IP: ");
+      Serial.println(client.remoteIP());
+      displayConnectionStatus(true);
+      lastFrameTime = millis();
+      frameCount = 0;
+    }
+    return;
   }
-  delay(1);
+  
+  // Check for incoming data
+  if (client.available() >= 11) {  // Need at least header size (4 + 1 + 4 + 2 = 11 bytes)
+    // Read magic bytes to determine packet type
+    char magic[4];
+    for (int i = 0; i < 4; i++) {
+      magic[i] = client.read();
+    }
+    
+    // Debug: print what we received
+    Serial.print("Magic bytes: ");
+    for (int i = 0; i < 4; i++) {
+      Serial.print((int)(uint8_t)magic[i], HEX);
+      Serial.print(" ");
+    }
+    Serial.println();
+    
+    bool success = false;
+    if (memcmp(magic, PIXEL_UPDATE_MAGIC, 4) == 0) {
+      // Already read magic, so adjust processPixelPacket to skip it
+      PixelPacketHeader header;
+      memcpy(header.magic, magic, 4);
+      
+      // Read rest of header
+      if (!readExact(((uint8_t*)&header) + 4, sizeof(header) - 4)) {
+        Serial.println("Failed to read pixel packet header");
+        return;
+      }
+      
+      // Verify version
+      if (header.version != PIXEL_PROTOCOL_VERSION) {
+        Serial.print("Unsupported pixel protocol version: ");
+        Serial.print(header.version);
+        Serial.print(" (expected ");
+        Serial.print(PIXEL_PROTOCOL_VERSION);
+        Serial.println(")");
+        return;
+      }
+      
+      // Read and apply pixel updates
+      Serial.print("Processing ");
+      Serial.print(header.count);
+      Serial.println(" pixel updates");
+      
+      for (uint16_t i = 0; i < header.count; i++) {
+        PixelUpdate update;
+        if (!readExact((uint8_t*)&update, sizeof(update))) {
+          Serial.println("Failed to read pixel update");
+          return;
+        }
+        
+        if (update.x < SCREEN_WIDTH && update.y < SCREEN_HEIGHT) {
+          gfx->drawPixel(update.x, update.y, update.color);  // Changed from writePixel
+          
+          // Debug first few pixels
+          if (i < 3) {
+            Serial.print("  Pixel: (");
+            Serial.print(update.x);
+            Serial.print(",");
+            Serial.print(update.y);
+            Serial.print(") color=0x");
+            Serial.println(update.color, HEX);
+          }
+        }
+      }
+      
+      // Force display update
+      gfx->flush();
+      
+      success = true;
+      
+    } else if (memcmp(magic, RUN_UPDATE_MAGIC, 4) == 0) {
+      // Already read magic, so adjust processRunPacket to skip it
+      RunPacketHeader header;
+      memcpy(header.magic, magic, 4);
+      
+      // Read rest of header
+      if (!readExact(((uint8_t*)&header) + 4, sizeof(header) - 4)) {
+        Serial.println("Failed to read run packet header");
+        return;
+      }
+      
+      // Verify version
+      if (header.version != RUN_PROTOCOL_VERSION) {
+        Serial.print("Unsupported run protocol version: ");
+        Serial.print(header.version);
+        Serial.print(" (expected ");
+        Serial.print(RUN_PROTOCOL_VERSION);
+        Serial.println(")");
+        return;
+      }
+      
+      // Read and apply run updates
+      Serial.print("Processing ");
+      Serial.print(header.count);
+      Serial.println(" run updates");
+      
+      for (uint16_t i = 0; i < header.count; i++) {
+        RunUpdate update;
+        if (!readExact((uint8_t*)&update, sizeof(update))) {
+          Serial.println("Failed to read run update");
+          return;
+        }
+        
+        // Draw horizontal line
+        if (update.y < SCREEN_HEIGHT && update.x0 < SCREEN_WIDTH) {
+          uint8_t endX = min((int)(update.x0 + update.length), (int)SCREEN_WIDTH);
+          
+          // Debug first run
+          if (i < 3) {
+            Serial.print("  Run: y=");
+            Serial.print(update.y);
+            Serial.print(" x0=");
+            Serial.print(update.x0);
+            Serial.print(" len=");
+            Serial.print(update.length);
+            Serial.print(" color=0x");
+            Serial.println(update.color, HEX);
+          }
+          
+          // Use drawPixel for runs
+          for (uint8_t x = update.x0; x < endX; x++) {
+            gfx->drawPixel(x, update.y, update.color);  // Changed from writePixel
+          }
+        }
+      }
+      
+      // Force display update
+      gfx->flush();
+      
+      success = true;
+      
+    } else {
+      Serial.println("Unknown packet type, discarding...");
+      return;
+    }
+    
+    if (success) {
+      frameCount++;
+      
+      // Calculate FPS every second
+      unsigned long currentTime = millis();
+      if (currentTime - lastFrameTime >= 1000) {
+        fps = (float)frameCount * 1000.0 / (float)(currentTime - lastFrameTime);
+        Serial.print("FPS: ");
+        Serial.println(fps, 1);
+        frameCount = 0;
+        lastFrameTime = currentTime;
+      }
+    } else {
+      Serial.println("Packet processing failed");
+      // Don't disconnect on single packet failure, just try to recover
+    }
+  }
+  
+  // Longer delay to reduce CPU usage and heat
+  delay(10);  // Increased from 1ms to 10ms
 }
-
